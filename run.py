@@ -8,9 +8,8 @@ import scipy
 import Constants
 from tqdm import tqdm
 from models.mmmodels import *
-#from torch.utils.data import DataLoader
 from torch_geometric.loader import DataLoader
-from dataLoader import datasets, Read_data, Split_data, Read_target
+from dataLoader import datasets, Read_data
 from utils.parsers import parser
 from utils.Metrics import Metrics
 from utils.EarlyStopping import *
@@ -64,7 +63,6 @@ def model_training(model, train_loader, epoch):
 
             loss.backward()
             model.optimizer.step()
-            # model.optimizer.update_learning_rate()
 
             ### tqdm parameter
             t.set_description(desc="Epoch %i" % epoch)
@@ -76,7 +74,7 @@ def model_training(model, train_loader, epoch):
 
         print('\tTotal Loss:\t%.3f' % total_loss)
 
-        return total_loss#, n_total_correct/n_total_words
+        return total_loss
 
 def model_testing(model, test_loader):
     ''' Epoch operation in evaluation phase '''
@@ -121,13 +119,7 @@ def model_testing(model, test_loader):
             total_mse += mse* bs
             total_mae += mae* bs
             total_src += corr* bs
-            print(f'tar:{tar} pred:{pred}')
-            # print(f'mse:{mse}')
-            # print(f'mae:{mae}')
-            # print(f'src:{corr}')
-            # batch_num += 1
-        # print(f'total mse:{total_mse / batch_num}')
-        # print(f'total mae:{total_mae / batch_num}')
+
         return total_mse/n_total_words, total_mae/n_total_words, total_src/n_total_words
       
 def train_test(epoch, model, train_loader, val_loader, test_loader):
@@ -157,17 +149,15 @@ def main(data_path, seed=2023):
     val_data = datasets(valid)
     test_data = datasets(test)
 
-    #### Build DataLoader
     train_loader = DataLoader(dataset=train_data, batch_size=opt.batch_size, shuffle=True, num_workers=8)
     val_loader = DataLoader(dataset=val_data, batch_size=opt.batch_size, shuffle=False, num_workers=8)
     test_loader = DataLoader(dataset=test_data, batch_size=opt.batch_size, shuffle=False, num_workers=8)
 
 
-    # ========= Early_stopping =========#
     save_model_path = opt.save_path + 'MMHG.pt'
     early_stopping = EarlyStopping(patience=opt.patience, verbose=True, path=save_model_path)
 
-    # ========= Building Model =========#
+
     model = trans_to_cuda(MMHG(args=opt, dropout=opt.dropout))
 
 
@@ -200,7 +190,6 @@ def main(data_path, seed=2023):
             print("Early_Stopping")
             break
     
-    # ========= Final score =========#
     print(" -(Finished!!) \n test scores: ")
     print("--------------------------------------------")
     print(f'test mse:{test_mse}')
