@@ -32,11 +32,6 @@ class Hyperedge(MessagePassing):
         if hyperedge_weight is None:
             hyperedge_weight = x.new_ones(num_edges)
 
-        D = scatter_add(hyperedge_weight[hyperedge_index[1]],
-                        hyperedge_index[0], dim=0, dim_size=num_nodes)
-        D = 1.0 / D
-        D[D == float("inf")] = 0
-
         B = scatter_add(x.new_ones(hyperedge_index.size(1)),
                         hyperedge_index[1], dim=0, dim_size=num_edges)
         B = 1.0 / B
@@ -61,7 +56,7 @@ class Hyperedge(MessagePassing):
         return out
 
 class HypergraphConv(MessagePassing):
-    def __init__(self, in_channels, out_channels, use_attention=False, heads= 1,
+    def __init__(self, in_channels, out_channels, heads= 1,
                  concat=True, negative_slope=0.2, dropout=0, bias=True,
                  **kwargs):
         kwargs.setdefault('aggr', 'add')
@@ -69,27 +64,33 @@ class HypergraphConv(MessagePassing):
 
         self.in_channels = in_channels
         self.out_channels = out_channels//heads
-        self.use_attention = use_attention
 
         self.hyperedge_func = Hyperedge()
 
-        self.linear1 = Linear(out_channels, out_channels, bias=False, weight_initializer='glorot')
-        self.linear2 = Linear(out_channels, out_channels, bias=False, weight_initializer='glorot')
-        self.layer_norm = nn.LayerNorm(out_channels)
+        # attention
+        self.heads = heads
+        self.concat = concat
+        self.negative_slope = negative_slope
+        self.dropout = dropout
 
-        if self.use_attention:
-            self.heads = heads
-            self.concat = concat
-            self.negative_slope = negative_slope
-            self.dropout = dropout
-            self.lin = Linear(in_channels, heads * self.out_channels, bias=False,
-                              weight_initializer='glorot')
-            self.att = Parameter(torch.Tensor(1, heads, 2 * self.out_channels))
-        else:
-            self.heads = 1
-            self.concat = True
-            self.lin = Linear(in_channels, out_channels, bias=False,
-                              weight_initializer='glorot')
+        self.lin = Linear(in_channels, heads * self.out_channels, bias=False,
+                            weight_initializer='glorot')
+        self.lin2 = Linear(in_channels, heads * self.out_channels, bias=False,
+                            weight_initializer='glorot')
+        
+        self.att = Parameter(torch.Tensor(1, heads,self.out_channels))
+        self.att2 = Parameter(torch.Tensor(1, heads, self.out_channels))
+
+        # FFN
+        self.FFN_1 = Linear(out_channels, out_channels, bias=False, weight_initializer='glorot')
+        self.FFN_2 = Linear(out_channels, out_channels, bias=False, weight_initializer='glorot')
+        self.FFN_3 = Linear(out_channels, out_channels, bias=False, weight_initializer='glorot')
+        self.FFN_4 = Linear(out_channels, out_channels, bias=False, weight_initializer='glorot')
+        self.layer_norm = nn.LayerNorm(out_channels)
+        # self.layer_norm2 = nn.LayerNorm(out_channels)
+        # self.layer_norm3 = nn.LayerNorm(out_channels)
+        # self.layer_norm4 = nn.LayerNorm(out_channels)
+        
 
         if bias and concat:
             self.bias = Parameter(torch.Tensor(heads * self.out_channels))
@@ -102,15 +103,19 @@ class HypergraphConv(MessagePassing):
 
     def reset_parameters(self):
         self.lin.reset_parameters()
-        if self.use_attention:
-            glorot(self.att)
+        self.lin2.reset_parameters()
+        self.FFN_1.reset_parameters()
+        self.FFN_2.reset_parameters()
+        self.FFN_3.reset_parameters()
+        self.FFN_4.reset_parameters()
+        
+        glorot(self.att)
+        glorot(self.att2)
         zeros(self.bias)
 
     def forward(self, x: Tensor, hyperedge_index: Tensor, x2: Tensor =None,
                 hyperedge_weight: Optional[Tensor] = None,
                 hyperedge_attr: Optional[Tensor] = None) -> Tensor:
-
-        hyperedge_attr = self.hyperedge_func(x, hyperedge_index)
 
         num_nodes, num_edges = x.size(0), 0
 
@@ -120,57 +125,65 @@ class HypergraphConv(MessagePassing):
         if hyperedge_weight is None:
             hyperedge_weight = x.new_ones(num_edges)
 
+        x = self.layer_norm(x)
+        residual  = x
         x = self.lin(x)
+        
+        hyperedge_attr = self.hyperedge_func(x, hyperedge_index)
+        hyperedge_attr = self.layer_norm(hyperedge_attr)
+        # hyperedge_attr = self.lin2(hyperedge_attr)
 
         alpha = None
+
         if x2 is not None:
-            if self.use_attention:
-                assert hyperedge_attr is not None
+            assert hyperedge_attr is not None
+            x = x.view(-1, self.heads, self.out_channels)
+            x2 = x2.view(-1, self.heads, self.out_channels)
+            hyperedge_attr = hyperedge_attr.view(-1, self.heads, self.out_channels)
 
-                x2 = self.lin(x2)
-                x = x.view(-1, self.heads, self.out_channels)
-                x2 = x2.view(-1, self.heads, self.out_channels)
-                hyperedge_attr = self.lin(hyperedge_attr)
-                hyperedge_attr = hyperedge_attr.view(-1, self.heads,
-                                                     self.out_channels)
+            x_i = x[hyperedge_index[0]]
+            x_j = hyperedge_attr[hyperedge_index[1]]
+            x2_i = x2[hyperedge_index[0]]
 
-                x_i = x[hyperedge_index[0]]
-                x_j = hyperedge_attr[hyperedge_index[1]]
+            # alpha = torch.cat([x_i, x_j], dim=-1)
+            # alpha2 = torch.cat([x2_i, x_j], dim=-1)
+            # alpha_mix = torch.cat([alpha, alpha2], dim = 0)
 
-                x2_i = x2[hyperedge_index[0]]
+            alpha = x_i.mul(x_j)
+            alpha2 = x2_i.mul(x_j)
+            alpha_mix = torch.cat([alpha, alpha2], dim = 0)
 
-                alpha = (torch.cat([x_i, x_j], dim=-1) * self.att).sum(dim=-1)
-                alpha2 = (torch.cat([x2_i, x_j], dim=-1) * self.att).sum(dim=-1)
+            alpha_mix = (alpha_mix * self.att).sum(dim=-1)
+            alpha_mix = F.leaky_relu(alpha_mix, self.negative_slope)
+            h_edge_index = torch.cat([hyperedge_index[0],hyperedge_index[0]], 0)
+            alpha_mix = softmax(alpha_mix, h_edge_index, num_nodes=x.size(0))
+            alpha_mix = F.dropout(alpha_mix, p=self.dropout, training=self.training)
+            alpha_mix, alpha_mix2 = torch.chunk(alpha_mix, 2, dim=0)
 
-                alpha_mix = torch.cat([alpha, alpha2], dim = 0)
+            # alpha_mix2 = (alpha2 * self.att).sum(dim=-1)
+            # alpha_mix2 = F.leaky_relu(alpha_mix2, self.negative_slope)
+            # alpha_mix2 = softmax(alpha_mix2, hyperedge_index[0], num_nodes=x.size(0))
 
-                alpha = F.leaky_relu(alpha, self.negative_slope)
-                alpha_mix = F.leaky_relu(alpha_mix, self.negative_slope)
+            # h_edge_index = torch.cat([hyperedge_index[0],hyperedge_index[0]], 0)
+            # alpha_mix = softmax(alpha_mix, h_edge_index, num_nodes=x.size(0))
+            # alpha_mix = F.dropout(alpha_mix, p=self.dropout, training=self.training)
+            # alpha_mix, alpha_mix2 = torch.chunk(alpha_mix, 2, dim=0)
 
-                h_edge_index = torch.cat([hyperedge_index[0],hyperedge_index[0]], 0)
-
-                alpha = softmax(alpha, hyperedge_index[0], num_nodes=x.size(0))
-                alpha = F.dropout(alpha, p=self.dropout, training=self.training)
-
-                alpha_mix = softmax(alpha_mix, h_edge_index, num_nodes=x.size(0))
-                alpha_mix = F.dropout(alpha_mix, p=self.dropout, training=self.training)
-
-                alpha_mix, alpha_mix2 = torch.chunk(alpha_mix, 2, dim=0)
 
         else:
-            if self.use_attention:
-                assert hyperedge_attr is not None
-                x = x.view(-1, self.heads, self.out_channels)
-                hyperedge_attr = self.lin(hyperedge_attr)
-                hyperedge_attr = hyperedge_attr.view(-1, self.heads,
+            assert hyperedge_attr is not None
+            x = x.view(-1, self.heads, self.out_channels)
+            # hyperedge_attr = self.lin(hyperedge_attr)
+            hyperedge_attr = hyperedge_attr.view(-1, self.heads,
                                                      self.out_channels)
-                x_i = x[hyperedge_index[0]]
-                x_j = hyperedge_attr[hyperedge_index[1]]
-                alpha = (torch.cat([x_i, x_j], dim=-1) * self.att).sum(dim=-1)
-                alpha = F.leaky_relu(alpha, self.negative_slope)
-                alpha = softmax(alpha, hyperedge_index[0], num_nodes=x.size(0))
-                alpha = F.dropout(alpha, p=self.dropout, training=self.training)
+            x_i = x[hyperedge_index[0]]
+            x_j = hyperedge_attr[hyperedge_index[1]]
+            alpha = (torch.cat([x_i, x_j], dim=-1) * self.att).sum(dim=-1)
+            alpha = F.leaky_relu(alpha, self.negative_slope)
+            alpha = softmax(alpha, hyperedge_index[0], num_nodes=x.size(0))
+            alpha = F.dropout(alpha, p=self.dropout, training=self.training)
 
+       
         D = scatter_add(hyperedge_weight[hyperedge_index[1]],
                         hyperedge_index[0], dim=0, dim_size=num_nodes)
         D = 1.0 / D
@@ -182,38 +195,72 @@ class HypergraphConv(MessagePassing):
         B[B == float("inf")] = 0
 
         if x2 is not None:
+
             out = self.propagate(hyperedge_index, x=x, norm=B, alpha=alpha_mix, size=(num_nodes, num_edges))
             out2 = self.propagate(hyperedge_index, x=x2, norm=B, alpha=alpha_mix2, size=(num_nodes, num_edges))
-            out = out + out2
+
+            x = x.view(-1, self.heads, self.out_channels)
+
+            hyperedge_attr = self.layer_norm(out.view(-1, self.heads*self.out_channels))
+            hyperedge_attr2 = self.layer_norm(out2.view(-1, self.heads*self.out_channels))
+
+            hyperedge_attr = hyperedge_attr.view(-1, self.heads, self.out_channels)
+            hyperedge_attr2 = hyperedge_attr2.view(-1, self.heads, self.out_channels)
+
+            x_i = x[hyperedge_index[0]]
+            x_j = hyperedge_attr[hyperedge_index[1]]
+            x2_j = hyperedge_attr2[hyperedge_index[1]]
+
+            alpha = x_i.mul(x_j)
+            alpha2 = x_i.mul(x2_j)
+            alpha_mix = torch.cat([alpha, alpha2], dim = 0)
+
+            alpha_mix = (alpha_mix * self.att2).sum(dim=-1)
+            alpha_mix = F.leaky_relu(alpha_mix, self.negative_slope)
+            h_edge_index = torch.cat([hyperedge_index[0],hyperedge_index[0]], 0)
+            alpha_mix = softmax(alpha_mix, h_edge_index, num_nodes=x.size(0))
+            alpha_mix = F.dropout(alpha_mix, p=self.dropout, training=self.training)
+            alpha_mix, alpha_mix2 = torch.chunk(alpha_mix, 2, dim=0)
+
+
+            out = self.propagate(hyperedge_index.flip([0]), x=out, norm=D, alpha=alpha_mix, size=(num_edges, num_nodes))
+            out2 = self.propagate(hyperedge_index.flip([0]), x=out2, norm=D, alpha=alpha_mix2, size=(num_edges, num_nodes))
+
         else:
             out = self.propagate(hyperedge_index, x=x, norm=B, alpha=alpha, size=(num_nodes, num_edges))
-
-        out = self.propagate(hyperedge_index.flip([0]), x=out, norm=D, alpha=alpha, size=(num_edges, num_nodes))
+            out = self.propagate(hyperedge_index.flip([0]), x=out, norm=D, alpha=alpha, size=(num_edges, num_nodes))
 
         if self.concat is True:
             out = out.view(-1, self.heads * self.out_channels)
+            out2 = out2.view(-1, self.heads * self.out_channels)
+
         else:
             out = out.mean(dim=1)
 
         if self.bias is not None:
             out = out + self.bias
 
+        # out = out +   out2   
+        out = self.FFN_2(F.relu(self.FFN_1(out) + self.FFN_3(out2)))
+        out = self.layer_norm(residual + out)
+        
         return out
 
-    def FFN(self, x: Tensor, x2: Tensor=None):
+    def FFN(self, hidden_state, fuse_state):
 
-        if x2 is not None:
-            img_text = torch.einsum("bqd,bkd->bqk", x, x2)
-            img_text_score = F.softmax(img_text, dim=-1)
-            V_att = img_text_score.bmm(x2)
-            x= x + V_att
+        fusion_scores = torch.matmul(hidden_state, fuse_state.transpose(-1, -2))  # bsz, len, dim
+        fusion_probs = F.softmax(fusion_scores, dim=-1)
+        fusion_output = torch.matmul(fusion_probs, fuse_state)
 
-        output = self.linear2(F.relu(self.linear1(x)))
-        output = F.dropout(output, p=self.dropout, training=self.training)
+        hidden_state2 = self.FFN_2(hidden_state)
+        fusion_output = self.FFN_3(fusion_output)
 
-        output = self.layer_norm(output + x)
+        out = F.gelu(hidden_state2 + fusion_output)
+        out = F.dropout(self.FFN_4(out), p=self.dropout, training=self.training)
+        out = self.layer_norm(out + hidden_state)
+  
+        return out
 
-        return output
 
     def message(self, x_j: Tensor, norm_i: Tensor, alpha: Tensor) -> Tensor:
         H, F = self.heads, self.out_channels
