@@ -1,6 +1,7 @@
 # RAGTrans
 
-A PyTorch implementation of our RAGTrans.
+A PyTorch implementation of RAGTrans(Retrieval-Augmented Hypergraph for Multimodal Social Media
+Popularity Prediction KDD 2024).
 
 ## Dependencies
 Install the dependencies via [Anaconda](https://www.anaconda.com/):
